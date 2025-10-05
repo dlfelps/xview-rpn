@@ -1,6 +1,7 @@
 """xView dataset wrapper for RPN training."""
 
 import json
+import pickle
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
@@ -22,6 +23,8 @@ class XViewDataset(Dataset):
         patch_size: int = 224,
         transform=None,
         min_object_size: int = 4,
+        cache_dir: str = None,
+        force_rebuild: bool = False,
     ):
         """
         Args:
@@ -30,21 +33,63 @@ class XViewDataset(Dataset):
             patch_size: Size of image patches (default 224)
             transform: Optional torchvision transforms
             min_object_size: Minimum object size in pixels to include
+            cache_dir: Directory to cache patch metadata (default: same as image_dir)
+            force_rebuild: Force rebuild cache even if it exists
         """
         self.image_dir = Path(image_dir)
         self.patch_size = patch_size
         self.transform = transform
         self.min_object_size = min_object_size
 
-        # Load GeoJSON annotations
-        with open(geojson_path, 'r') as f:
-            self.geojson_data = json.load(f)
+        # Set cache directory
+        if cache_dir is None:
+            cache_dir = self.image_dir.parent / 'cache'
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
 
-        # Build image annotations mapping
-        self.image_annotations = self._build_image_annotations()
+        # Generate cache filename based on parameters
+        cache_filename = f'patches_ps{patch_size}_minsize{min_object_size}.pkl'
+        self.cache_path = self.cache_dir / cache_filename
 
-        # Generate all patches
-        self.patches = self._generate_patches()
+        # Load or generate patches
+        if not force_rebuild and self.cache_path.exists():
+            print(f'Loading cached patches from {self.cache_path}...')
+            with open(self.cache_path, 'rb') as f:
+                cache_data = pickle.load(f)
+
+            # Handle old cache format (just a list) or new format (dict with base_path)
+            if isinstance(cache_data, dict):
+                cached_base = cache_data['base_path']
+                self.patches = cache_data['patches']
+                print(f'Loaded {len(self.patches)} patches from cache (base: {cached_base})')
+            else:
+                # Old format - assume patches already have absolute paths
+                self.patches = cache_data
+                print(f'Loaded {len(self.patches)} patches from cache (old format)')
+        else:
+            print('Generating patches (this may take a while)...')
+            # Load GeoJSON annotations
+            with open(geojson_path, 'r') as f:
+                self.geojson_data = json.load(f)
+
+            # Build image annotations mapping
+            self.image_annotations = self._build_image_annotations()
+
+            # Generate all patches
+            self.patches = self._generate_patches()
+
+            # Save to cache (convert to relative paths)
+            print(f'Saving {len(self.patches)} patches to cache at {self.cache_path}...')
+            cache_data = {
+                'base_path': str(self.image_dir),
+                'patches': self._convert_to_relative_paths(self.patches)
+            }
+            with open(self.cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            print('Cache saved successfully')
+
+        # Convert cached relative paths to absolute paths
+        self.patches = self._convert_to_absolute_paths(self.patches)
 
     def _build_image_annotations(self) -> Dict[str, List[Dict]]:
         """Group annotations by image_id."""
@@ -125,11 +170,33 @@ class XViewDataset(Dataset):
                     if objects:
                         patches.append({
                             'image_path': str(image_file),
+                            'image_id': image_id,
                             'patch_coords': (x, y),
                             'objects': objects,
                         })
 
         return patches
+
+    def _convert_to_relative_paths(self, patches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert absolute image paths to relative paths (just image_id)."""
+        relative_patches = []
+        for patch in patches:
+            relative_patch = patch.copy()
+            # Store only the image filename, not the full path
+            relative_patch['image_path'] = patch['image_id']
+            relative_patches.append(relative_patch)
+        return relative_patches
+
+    def _convert_to_absolute_paths(self, patches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert relative image paths to absolute paths using current image_dir."""
+        absolute_patches = []
+        for patch in patches:
+            absolute_patch = patch.copy()
+            # Reconstruct full path using current image_dir
+            image_filename = patch['image_path']
+            absolute_patch['image_path'] = str(self.image_dir / image_filename)
+            absolute_patches.append(absolute_patch)
+        return absolute_patches
 
     def __len__(self) -> int:
         return len(self.patches)
