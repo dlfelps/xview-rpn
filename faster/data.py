@@ -194,6 +194,8 @@ class XViewDataset(Dataset):
             absolute_patch = patch.copy()
             # Reconstruct full path using current image_dir
             image_filename = patch['image_path']
+            # Extract just the filename if it's already a path
+            image_filename = Path(image_filename).name
             absolute_patch['image_path'] = str(self.image_dir / image_filename)
             absolute_patches.append(absolute_patch)
         return absolute_patches

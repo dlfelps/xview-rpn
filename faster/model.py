@@ -30,19 +30,33 @@ def create_rpn_model(
     Returns:
         Faster R-CNN model configured for RPN training
     """
-    # Load pretrained Faster R-CNN
-    model = fasterrcnn_resnet50_fpn(
-        weights='DEFAULT' if pretrained else None,
-        min_size=min_size,
-        max_size=min_size * 2,
-    )
-
     # Configure custom RPN anchors
     anchor_generator = AnchorGenerator(
         sizes=tuple([anchor_sizes] * 5),  # 5 feature maps in FPN
         aspect_ratios=tuple([aspect_ratios] * 5),
     )
-    model.rpn.anchor_generator = anchor_generator
+
+    # Load pretrained Faster R-CNN with custom anchor generator
+    # First create model without weights to get correct RPN head dimensions
+    model = fasterrcnn_resnet50_fpn(
+        weights=None,
+        min_size=min_size,
+        max_size=min_size * 2,
+        rpn_anchor_generator=anchor_generator,
+    )
+
+    # Load pretrained weights if requested (skip incompatible RPN head)
+    if pretrained:
+        from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
+        weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+        state_dict = weights.get_state_dict(progress=True, check_hash=True)
+
+        # Remove RPN head weights that don't match our custom anchor configuration
+        rpn_keys_to_remove = [k for k in state_dict.keys() if k.startswith('rpn.head.')]
+        for key in rpn_keys_to_remove:
+            del state_dict[key]
+
+        model.load_state_dict(state_dict, strict=False)
 
     # Freeze backbone if requested
     if freeze_backbone:

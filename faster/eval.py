@@ -175,7 +175,7 @@ def main():
 
     # Load checkpoint
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.to(device)
     print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
 
