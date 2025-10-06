@@ -126,7 +126,8 @@ class RPNTrainer:
     @torch.no_grad()
     def eval_step(self, images, targets):
         """Execute single evaluation step."""
-        self.model.eval()
+        # Keep model in train mode to get loss dict (no gradient update due to @torch.no_grad())
+        self.model.train()
 
         # Move to device
         images = [img.to(self.device) for img in images]
