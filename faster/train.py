@@ -76,13 +76,19 @@ def main():
     parser.add_argument('--epochs', type=int, default=10,
                         help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
+                        help='Learning rate for RPN')
+    parser.add_argument('--backbone-lr', type=float, default=0.0001,
+                        help='Learning rate for backbone (if unfrozen)')
+    parser.add_argument('--unfreeze-backbone', action='store_true',
+                        help='Unfreeze backbone for training')
     parser.add_argument('--val-split', type=float, default=0.1,
                         help='Validation split ratio')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of dataloader workers')
     parser.add_argument('--save-dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints')
+    parser.add_argument('--force-rebuild-cache', action='store_true',
+                        help='Force rebuild of patch cache')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
     args = parser.parse_args()
@@ -101,6 +107,7 @@ def main():
         image_dir=args.data_dir,
         geojson_path=args.geojson,
         patch_size=224,
+        force_rebuild=args.force_rebuild_cache,
     )
     print(f'Total patches: {len(dataset)}')
 
@@ -134,7 +141,7 @@ def main():
     print('Creating model...')
     model = create_rpn_model(
         pretrained=True,
-        freeze_backbone=True,
+        freeze_backbone=not args.unfreeze_backbone,
         freeze_roi_heads=True,
         min_size=224,
         anchor_sizes=(16, 32, 64),
@@ -142,9 +149,18 @@ def main():
     )
     model.to(device)
 
-    # Create optimizer (only for RPN parameters)
-    rpn_params = [p for p in model.rpn.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(rpn_params, lr=args.lr)
+    # Create optimizer with different learning rates for backbone and RPN
+    if args.unfreeze_backbone:
+        print(f'Training with unfrozen backbone (backbone_lr={args.backbone_lr}, rpn_lr={args.lr})')
+        param_groups = [
+            {'params': [p for p in model.backbone.parameters() if p.requires_grad], 'lr': args.backbone_lr},
+            {'params': [p for p in model.rpn.parameters() if p.requires_grad], 'lr': args.lr},
+        ]
+        optimizer = torch.optim.Adam(param_groups)
+    else:
+        print(f'Training with frozen backbone (rpn_lr={args.lr})')
+        rpn_params = [p for p in model.rpn.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(rpn_params, lr=args.lr)
 
     # Create trainer
     trainer = RPNTrainer(model, optimizer, device)

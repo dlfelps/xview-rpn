@@ -8,6 +8,7 @@ from typing import List, Tuple, Dict, Any
 import numpy as np
 import rasterio
 import torch
+import torchvision.transforms.functional as TF
 from PIL import Image
 from shapely.geometry import shape, box
 from torch.utils.data import Dataset
@@ -145,16 +146,21 @@ class XViewDataset(Dataset):
                         xmin, ymin, xmax, ymax = ann['bounds']
                         obj_box = box(xmin, ymin, xmax, ymax)
 
-                        if patch_box.intersects(obj_box):
-                            # Calculate intersection
-                            intersection = patch_box.intersection(obj_box)
-                            int_bounds = intersection.bounds  # (minx, miny, maxx, maxy)
+                        # Check if object is completely contained in patch (not partial)
+                        if patch_box.contains(obj_box):
+                            # Get object dimensions in original coordinates
+                            orig_width = xmax - xmin
+                            orig_height = ymax - ymin
+
+                            # Skip objects that are >= 64x64 pixels
+                            if orig_width >= 64 or orig_height >= 64:
+                                continue
 
                             # Convert to patch-relative coordinates
-                            rel_xmin = int_bounds[0] - x
-                            rel_ymin = int_bounds[1] - y
-                            rel_xmax = int_bounds[2] - x
-                            rel_ymax = int_bounds[3] - y
+                            rel_xmin = xmin - x
+                            rel_ymin = ymin - y
+                            rel_xmax = xmax - x
+                            rel_ymax = ymax - y
 
                             # Filter out very small objects
                             obj_width = rel_xmax - rel_xmin
@@ -254,8 +260,9 @@ class XViewDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         else:
-            # Default: convert to tensor and normalize
-            image = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
+            # Default: convert to tensor and normalize to [0, 1]
+            # to_tensor converts PIL image (H, W, C) to tensor (C, H, W) and scales to [0, 1]
+            image = TF.to_tensor(image)
 
         return image, target
 
