@@ -41,6 +41,12 @@ class XViewDataset(Dataset):
         self.patch_size = patch_size
         self.transform = transform
         self.min_object_size = min_object_size
+        self.geojson_path = geojson_path
+
+        # Build class mapping (xView type_ids to sequential labels)
+        # This will be populated when loading/generating patches
+        self.class_mapping = {}  # {type_id: sequential_label}
+        self.num_classes = 0
 
         # Set cache directory
         if cache_dir is None:
@@ -62,11 +68,15 @@ class XViewDataset(Dataset):
             if isinstance(cache_data, dict):
                 cached_base = cache_data['base_path']
                 self.patches = cache_data['patches']
+                self.class_mapping = cache_data.get('class_mapping', {})
+                self.num_classes = cache_data.get('num_classes', 0)
                 print(f'Loaded {len(self.patches)} patches from cache (base: {cached_base})')
+                print(f'Loaded {self.num_classes} classes')
             else:
                 # Old format - assume patches already have absolute paths
                 self.patches = cache_data
                 print(f'Loaded {len(self.patches)} patches from cache (old format)')
+                # Will need to rebuild to get class mapping
         else:
             print('Generating patches (this may take a while)...')
             # Load GeoJSON annotations
@@ -79,11 +89,16 @@ class XViewDataset(Dataset):
             # Generate all patches
             self.patches = self._generate_patches()
 
+            # Build class mapping from all patches
+            self._build_class_mapping()
+
             # Save to cache (convert to relative paths)
             print(f'Saving {len(self.patches)} patches to cache at {self.cache_path}...')
             cache_data = {
                 'base_path': str(self.image_dir),
-                'patches': self._convert_to_relative_paths(self.patches)
+                'patches': self._convert_to_relative_paths(self.patches),
+                'class_mapping': self.class_mapping,
+                'num_classes': self.num_classes,
             }
             with open(self.cache_path, 'wb') as f:
                 pickle.dump(cache_data, f)
@@ -183,6 +198,22 @@ class XViewDataset(Dataset):
 
         return patches
 
+    def _build_class_mapping(self):
+        """Build mapping from xView type_ids to sequential 1-indexed labels."""
+        # Collect all unique type_ids
+        type_ids = set()
+        for patch in self.patches:
+            for obj in patch['objects']:
+                type_ids.add(obj['type_id'])
+
+        # Sort and create sequential mapping (1-indexed, 0 is background)
+        sorted_type_ids = sorted(type_ids)
+        self.class_mapping = {type_id: idx + 1 for idx, type_id in enumerate(sorted_type_ids)}
+        self.num_classes = len(self.class_mapping) + 1  # +1 for background
+
+        print(f'Built class mapping: {len(self.class_mapping)} classes')
+        print(f'Type IDs: {sorted_type_ids[:10]}{"..." if len(sorted_type_ids) > 10 else ""}')
+
     def _convert_to_relative_paths(self, patches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Convert absolute image paths to relative paths (just image_id)."""
         relative_patches = []
@@ -245,8 +276,11 @@ class XViewDataset(Dataset):
 
         for obj in patch_info['objects']:
             boxes.append(obj['bbox'])
-            # All objects get label 1 (object vs background)
-            labels.append(1)
+            # Map xView type_id to sequential label using class_mapping
+            # class_mapping maps type_id -> 1-indexed label (0 is background)
+            type_id = obj['type_id']
+            label = self.class_mapping.get(type_id, 1)  # Default to 1 if not found
+            labels.append(label)
 
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
         labels = torch.as_tensor(labels, dtype=torch.int64)

@@ -8,15 +8,15 @@ from torchvision.models.detection.rpn import AnchorGenerator
 
 def create_rpn_model(
     pretrained: bool = True,
-    freeze_backbone: bool = True,
-    freeze_roi_heads: bool = True,
+    freeze_backbone: bool = False,
+    freeze_roi_heads: bool = False,
     min_size: int = 224,
     anchor_sizes: tuple = (16, 32, 64),
     aspect_ratios: tuple = (0.5, 1.0, 2.0),
-    num_classes: int = 2,  # background + object
+    num_classes: int = 91,  # Default COCO classes, will be replaced
 ):
     """
-    Create Faster R-CNN model configured for RPN-only training.
+    Create Faster R-CNN model for full training (backbone + RPN + ROI heads).
 
     Args:
         pretrained: Use pretrained weights
@@ -25,10 +25,10 @@ def create_rpn_model(
         min_size: Minimum input image size
         anchor_sizes: RPN anchor sizes
         aspect_ratios: RPN anchor aspect ratios
-        num_classes: Number of classes (2 for binary object detection)
+        num_classes: Number of classes (including background at index 0)
 
     Returns:
-        Faster R-CNN model configured for RPN training
+        Faster R-CNN model for full training
     """
     # Configure custom RPN anchors
     anchor_generator = AnchorGenerator(
@@ -36,27 +36,34 @@ def create_rpn_model(
         aspect_ratios=tuple([aspect_ratios] * 5),
     )
 
-    # Load pretrained Faster R-CNN with custom anchor generator
-    # First create model without weights to get correct RPN head dimensions
+    # Load pretrained Faster R-CNN with custom anchor generator and num_classes
+    # First create model without weights to get correct dimensions
     model = fasterrcnn_resnet50_fpn(
         weights=None,
         min_size=min_size,
         max_size=min_size * 2,
         rpn_anchor_generator=anchor_generator,
+        num_classes=num_classes,
     )
 
-    # Load pretrained weights if requested (skip incompatible RPN head)
+    # Load pretrained weights if requested (skip incompatible RPN head and ROI box predictor)
     if pretrained:
         from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
         weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
         state_dict = weights.get_state_dict(progress=True, check_hash=True)
 
-        # Remove RPN head weights that don't match our custom anchor configuration
-        rpn_keys_to_remove = [k for k in state_dict.keys() if k.startswith('rpn.head.')]
-        for key in rpn_keys_to_remove:
+        # Remove weights that don't match our custom configuration
+        keys_to_remove = []
+        # Remove RPN head (custom anchors)
+        keys_to_remove.extend([k for k in state_dict.keys() if k.startswith('rpn.head.')])
+        # Remove ROI box predictor (custom num_classes)
+        keys_to_remove.extend([k for k in state_dict.keys() if k.startswith('roi_heads.box_predictor.')])
+
+        for key in keys_to_remove:
             del state_dict[key]
 
         model.load_state_dict(state_dict, strict=False)
+        print(f'Loaded pretrained weights (excluded RPN head and ROI box predictor)')
 
     # Freeze backbone if requested
     if freeze_backbone:
@@ -99,61 +106,54 @@ class RPNTrainer:
         self.device = device
 
     def train_step(self, images, targets):
-        """Execute single training step."""
+        """Execute single training step (full Faster R-CNN)."""
         self.model.train()
-        #  Set ROI head to eval to prevent it from computing losses
-        self.model.roi_heads.eval()
 
         # Move to device
         images = [img.to(self.device) for img in images]
         targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
 
-        # Forward pass - get features and RPN outputs only
-        images_transformed, targets_transformed = self.model.transform(images, targets)
-        features = self.model.backbone(images_transformed.tensors)
+        # Forward pass - returns loss dict in training mode
+        loss_dict = self.model(images, targets)
 
-        # Get RPN losses directly
-        proposals, rpn_losses = self.model.rpn(images_transformed, features, targets_transformed)
-
-        # Compute RPN-only loss
-        rpn_loss = rpn_losses['loss_objectness'] + rpn_losses['loss_rpn_box_reg']
+        # Compute total loss
+        losses = sum(loss for loss in loss_dict.values())
 
         # Backward pass
         self.optimizer.zero_grad()
-        rpn_loss.backward()
+        losses.backward()
         self.optimizer.step()
 
         return {
-            'rpn_loss': rpn_loss.item(),
-            'loss_objectness': rpn_losses['loss_objectness'].item(),
-            'loss_rpn_box_reg': rpn_losses['loss_rpn_box_reg'].item(),
+            'total_loss': losses.item(),
+            'loss_classifier': loss_dict['loss_classifier'].item(),
+            'loss_box_reg': loss_dict['loss_box_reg'].item(),
+            'loss_objectness': loss_dict['loss_objectness'].item(),
+            'loss_rpn_box_reg': loss_dict['loss_rpn_box_reg'].item(),
         }
 
     @torch.no_grad()
     def eval_step(self, images, targets):
-        """Execute single evaluation step."""
+        """Execute single evaluation step (full Faster R-CNN)."""
         # Keep model in train mode to get loss dict (no gradient update due to @torch.no_grad())
         self.model.train()
-        self.model.roi_heads.eval()
 
         # Move to device
         images = [img.to(self.device) for img in images]
         targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
 
-        # Forward pass - get features and RPN outputs only
-        images_transformed, targets_transformed = self.model.transform(images, targets)
-        features = self.model.backbone(images_transformed.tensors)
+        # Forward pass - returns loss dict in training mode
+        loss_dict = self.model(images, targets)
 
-        # Get RPN losses directly
-        proposals, rpn_losses = self.model.rpn(images_transformed, features, targets_transformed)
-
-        # Compute RPN-only loss
-        rpn_loss = rpn_losses['loss_objectness'] + rpn_losses['loss_rpn_box_reg']
+        # Compute total loss
+        losses = sum(loss for loss in loss_dict.values())
 
         return {
-            'rpn_loss': rpn_loss.item(),
-            'loss_objectness': rpn_losses['loss_objectness'].item(),
-            'loss_rpn_box_reg': rpn_losses['loss_rpn_box_reg'].item(),
+            'total_loss': losses.item(),
+            'loss_classifier': loss_dict['loss_classifier'].item(),
+            'loss_box_reg': loss_dict['loss_box_reg'].item(),
+            'loss_objectness': loss_dict['loss_objectness'].item(),
+            'loss_rpn_box_reg': loss_dict['loss_rpn_box_reg'].item(),
         }
 
     @torch.no_grad()

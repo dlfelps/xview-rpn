@@ -125,17 +125,23 @@ def main():
     # Create model
     print('Loading model...')
     model = create_rpn_model(
-        pretrained=False,
-        freeze_backbone=True,
+        pretrained=False,  # Don't load pretrained weights, we'll load from checkpoint
+        freeze_backbone=False,  # Don't freeze so we can load trained backbone weights
         freeze_roi_heads=True,
         min_size=224,
         anchor_sizes=(16, 32, 64),
         aspect_ratios=(0.5, 1.0, 2.0),
     )
 
-    # Load checkpoint
+    # Load checkpoint (loads both backbone and RPN weights)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+    # Freeze after loading (for inference)
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    for param in model.rpn.parameters():
+        param.requires_grad = False
     model.to(device)
     model.eval()
     print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
