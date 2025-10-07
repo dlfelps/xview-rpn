@@ -101,16 +101,22 @@ class RPNTrainer:
     def train_step(self, images, targets):
         """Execute single training step."""
         self.model.train()
+        #  Set ROI head to eval to prevent it from computing losses
+        self.model.roi_heads.eval()
 
         # Move to device
         images = [img.to(self.device) for img in images]
         targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
 
-        # Forward pass
-        loss_dict = self.model(images, targets)
+        # Forward pass - get features and RPN outputs only
+        images_transformed, targets_transformed = self.model.transform(images, targets)
+        features = self.model.backbone(images_transformed.tensors)
+
+        # Get RPN losses directly
+        proposals, rpn_losses = self.model.rpn(images_transformed, features, targets_transformed)
 
         # Compute RPN-only loss
-        rpn_loss = compute_rpn_loss(loss_dict)
+        rpn_loss = rpn_losses['loss_objectness'] + rpn_losses['loss_rpn_box_reg']
 
         # Backward pass
         self.optimizer.zero_grad()
@@ -119,8 +125,8 @@ class RPNTrainer:
 
         return {
             'rpn_loss': rpn_loss.item(),
-            'loss_objectness': loss_dict['loss_objectness'].item(),
-            'loss_rpn_box_reg': loss_dict['loss_rpn_box_reg'].item(),
+            'loss_objectness': rpn_losses['loss_objectness'].item(),
+            'loss_rpn_box_reg': rpn_losses['loss_rpn_box_reg'].item(),
         }
 
     @torch.no_grad()
@@ -128,21 +134,26 @@ class RPNTrainer:
         """Execute single evaluation step."""
         # Keep model in train mode to get loss dict (no gradient update due to @torch.no_grad())
         self.model.train()
+        self.model.roi_heads.eval()
 
         # Move to device
         images = [img.to(self.device) for img in images]
         targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
 
-        # Forward pass
-        loss_dict = self.model(images, targets)
+        # Forward pass - get features and RPN outputs only
+        images_transformed, targets_transformed = self.model.transform(images, targets)
+        features = self.model.backbone(images_transformed.tensors)
+
+        # Get RPN losses directly
+        proposals, rpn_losses = self.model.rpn(images_transformed, features, targets_transformed)
 
         # Compute RPN-only loss
-        rpn_loss = compute_rpn_loss(loss_dict)
+        rpn_loss = rpn_losses['loss_objectness'] + rpn_losses['loss_rpn_box_reg']
 
         return {
             'rpn_loss': rpn_loss.item(),
-            'loss_objectness': loss_dict['loss_objectness'].item(),
-            'loss_rpn_box_reg': loss_dict['loss_rpn_box_reg'].item(),
+            'loss_objectness': rpn_losses['loss_objectness'].item(),
+            'loss_rpn_box_reg': rpn_losses['loss_rpn_box_reg'].item(),
         }
 
     @torch.no_grad()
