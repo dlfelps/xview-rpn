@@ -103,6 +103,8 @@ def main():
                         help='Force rebuild of patch cache')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     args = parser.parse_args()
 
     # Create save directory
@@ -172,11 +174,23 @@ def main():
     # Create trainer
     trainer = RPNTrainer(model, optimizer, device)
 
-    # Training loop
-    print('Starting training...')
+    # Resume from checkpoint if specified
+    start_epoch = 1
     best_val_loss = float('inf')
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        print(f'Resuming from checkpoint: {args.resume}')
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('val_loss', float('inf'))
+        print(f'Resumed from epoch {checkpoint["epoch"]}, best val loss: {best_val_loss:.4f}')
+
+    # Training loop
+    print('Starting training...')
+
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f'\nEpoch {epoch}/{args.epochs}')
 
         # Train

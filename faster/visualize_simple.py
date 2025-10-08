@@ -13,50 +13,90 @@ from faster.model import create_rpn_model
 
 
 def get_rpn_proposals_with_scores(model, image, device):
-    """Get RPN proposals with their objectness scores.
-
-    This monkey-patches the RPN to capture proposals and scores.
-    """
-    proposals_out = []
-    scores_out = []
-
-    # Store original filter_proposals
-    original_filter = model.rpn.filter_proposals
-
-    def capture_filter_proposals(proposals, objectness, image_shapes, num_anchors_per_level):
-        """Wrapper to capture proposals and scores before filtering."""
-        # Call original filter
-        result = original_filter(proposals, objectness, image_shapes, num_anchors_per_level)
-
-        # Capture the objectness scores for the filtered proposals
-        # The filter_proposals returns boxes, but we need to track scores
-        # Let's compute them from objectness
-        for obj, prop in zip(objectness, result):
-            # Get objectness probabilities
-            scores = torch.sigmoid(obj).flatten()
-            # Sort and take top N to match filtered proposals
-            top_scores, _ = torch.sort(scores, descending=True)
-            top_scores = top_scores[:len(prop)]
-            scores_out.append(top_scores)
-
-        proposals_out.extend(result)
-        return result
-
-    # Monkey patch
-    model.rpn.filter_proposals = capture_filter_proposals
-
-    # Run model
+    """Get RPN proposals with their objectness scores directly."""
     with torch.no_grad():
         model.eval()
-        _ = model([image.to(device)])
 
-    # Restore original
-    model.rpn.filter_proposals = original_filter
+        # Transform image
+        images = [image.to(device)]
+        original_image_sizes = [img.shape[-2:] for img in images]
 
-    if len(proposals_out) > 0 and len(scores_out) > 0:
-        return proposals_out[0], scores_out[0]
-    else:
-        return torch.zeros((0, 4)), torch.zeros((0,))
+        # Get image transformed
+        images_transformed, _ = model.transform(images, None)
+
+        # Get features from backbone
+        features = model.backbone(images_transformed.tensors)
+
+        # Get RPN outputs (objectness and bbox deltas)
+        objectness_logits, pred_bbox_deltas = model.rpn.head(list(features.values()))
+
+        # Get anchors
+        anchors = model.rpn.anchor_generator(images_transformed, list(features.values()))
+
+        # Decode boxes using the RPN's internal method
+        from torchvision.ops import boxes as box_ops
+
+        # Process each image separately (we only have 1 image in this case)
+        num_images = len(images)
+
+        # Decode boxes per level and concatenate
+        proposals_list = []
+        scores_list = []
+
+        for idx in range(num_images):
+            proposals_per_level = []
+            scores_per_level = []
+
+            # Process each FPN level
+            for obj_logits, box_reg in zip(objectness_logits, pred_bbox_deltas):
+                # obj_logits: [batch, num_anchors, H, W]
+                # box_reg: [batch, num_anchors * 4, H, W]
+
+                N, A, H, W = obj_logits.shape
+
+                # Flatten spatial dimensions for this image
+                # obj_logits: [N, A, H, W] -> [A, H, W] -> [H, W, A] -> [H*W*A]
+                obj_logits_flat = obj_logits[idx].permute(1, 2, 0).reshape(-1)
+
+                # box_reg: [N, A*4, H, W] -> [A*4, H, W] -> [A, 4, H, W] -> [H, W, A, 4] -> [H*W*A, 4]
+                box_reg_flat = box_reg[idx].view(A, 4, H, W).permute(2, 3, 0, 1).reshape(-1, 4)
+
+                proposals_per_level.append(box_reg_flat)
+                scores_per_level.append(obj_logits_flat)
+
+            # Concatenate all levels
+            box_deltas_all = torch.cat(proposals_per_level, dim=0)  # [total_anchors, 4]
+            objectness_all = torch.cat(scores_per_level, dim=0)  # [total_anchors]
+
+            # Decode boxes - anchors[idx] is already [num_anchors, 4]
+            # Decoder returns [num_anchors, num_images, 4], we want [num_anchors, 4]
+            proposals_decoded = model.rpn.box_coder.decode(box_deltas_all, [anchors[idx]])
+            proposals_idx = proposals_decoded[:, 0, :]  # [num_anchors, 4]
+
+            # Clip to image bounds
+            proposals_idx = box_ops.clip_boxes_to_image(
+                proposals_idx, images_transformed.image_sizes[idx]
+            )
+
+            # Get objectness scores (sigmoid for probability)
+            scores_idx = torch.sigmoid(objectness_all)
+
+            # Filter by top N before NMS
+            num_anchors = scores_idx.shape[0]
+            pre_nms_top_n = min(model.rpn._pre_nms_top_n['testing'], num_anchors)
+            top_scores, top_idx = scores_idx.topk(pre_nms_top_n)
+            proposals_idx = proposals_idx[top_idx]
+
+            # Apply NMS
+            keep = box_ops.nms(proposals_idx, top_scores, model.rpn.nms_thresh)
+
+            # Keep only post_nms_top_n
+            keep = keep[: model.rpn._post_nms_top_n['testing']]
+
+            proposals_list.append(proposals_idx[keep])
+            scores_list.append(top_scores[keep])
+
+        return proposals_list[0], scores_list[0]
 
 
 def draw_boxes_on_image(image_tensor, boxes, scores, score_threshold=0.5, max_boxes=100):
@@ -122,29 +162,25 @@ def main():
     )
     print(f'Total patches: {len(dataset)}')
 
-    # Create model
+    # Create model with correct number of classes
     print('Loading model...')
     model = create_rpn_model(
         pretrained=False,  # Don't load pretrained weights, we'll load from checkpoint
-        freeze_backbone=False,  # Don't freeze so we can load trained backbone weights
-        freeze_roi_heads=True,
+        freeze_backbone=False,  # Don't freeze so we can load trained weights
+        freeze_roi_heads=False,  # Don't freeze so we can load ROI head weights
         min_size=224,
         anchor_sizes=(16, 32, 64),
         aspect_ratios=(0.5, 1.0, 2.0),
+        num_classes=dataset.num_classes,  # Use dataset's number of classes
     )
 
-    # Load checkpoint (loads both backbone and RPN weights)
+    # Load checkpoint (loads full model: backbone + RPN + ROI heads)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-
-    # Freeze after loading (for inference)
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-    for param in model.rpn.parameters():
-        param.requires_grad = False
     model.to(device)
     model.eval()
     print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+    print(f"Model has {dataset.num_classes} classes")
 
     # Process samples
     print(f'\nGenerating proposals for {args.num_samples} samples...')
